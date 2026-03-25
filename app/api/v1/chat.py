@@ -592,6 +592,8 @@ def validate_request(request: ChatCompletionRequest):
                     code="invalid_tool_choice",
                 )
 
+    model_info = ModelService.get(request.model)
+
     # image 验证
     if model_info and (model_info.is_image or model_info.is_image_edit):
         prompt, image_urls = _extract_prompt_images(request.messages)
