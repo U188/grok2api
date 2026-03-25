@@ -50,7 +50,7 @@ class ImageEditService:
 
     @staticmethod
     def _build_request_overrides(n: int) -> Dict[str, Any]:
-        return {"imageGenerationCount": max(1, int(n or 1))}
+        return {"imageGenerationCount": max(1, int(n or 1)), "disableSearch": True}
 
     async def edit(
         self,

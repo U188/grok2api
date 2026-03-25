@@ -3,12 +3,15 @@ Image Generation API 路由
 """
 
 import base64
+import io
 import time
 from pathlib import Path
 from typing import List, Optional, Union
 
-from fastapi import APIRouter, File, Form, UploadFile
+import httpx
+from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel, Field, ValidationError
 
 from app.services.grok.services.image import ImageGenerationService
@@ -322,8 +325,9 @@ async def create_image(request: ImageGenerationRequest):
 
 @router.post("/images/edits")
 async def edit_image(
-    prompt: str = Form(...),
-    image: List[UploadFile] = File(...),
+    request: Request,
+    prompt: Optional[str] = Form(None),
+    image: Optional[List[UploadFile]] = File(None),
     model: Optional[str] = Form("grok-imagine-1.0-edit"),
     n: int = Form(1),
     size: str = Form("1024x1024"),
@@ -335,8 +339,41 @@ async def edit_image(
     """
     Image Edits API
 
-    同官方 API 格式，仅支持 multipart/form-data 文件上传
+    支持 multipart/form-data 文件上传 和 application/json (image_url) 两种方式
     """
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        body = await request.json()
+        prompt = body.get("prompt")
+        model = body.get("model", "grok-imagine-1.0-edit")
+        n = int(body.get("n", 1))
+        size = body.get("size", "1024x1024")
+        quality = body.get("quality", "standard")
+        response_format = body.get("response_format")
+        style = body.get("style")
+        stream = body.get("stream", False)
+        image_url = body.get("image_url")
+        if not image_url:
+            return JSONResponse(status_code=400, content={"error": {"message": "image_url is required for image edits", "type": "invalid_request_error"}})
+        if isinstance(image_url, str):
+            image_url = [image_url]
+        if not isinstance(image_url, list):
+            return JSONResponse(status_code=400, content={"error": {"message": "image_url must be a string or array", "type": "invalid_request_error"}})
+        image = []
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            for idx, url in enumerate(image_url):
+                try:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                except Exception as e:
+                    return JSONResponse(status_code=400, content={"error": {"message": f"failed to download image_url[{idx}]: {e}", "type": "invalid_request_error"}})
+                buf = io.BytesIO(resp.content)
+                upload = UploadFile(filename=f"image_{idx}.png", file=buf)
+                image.append(upload)
+    if not prompt:
+        return JSONResponse(status_code=400, content={"error": {"message": "prompt is required", "type": "invalid_request_error"}})
+    if not image:
+        return JSONResponse(status_code=400, content={"error": {"message": "image is required", "type": "invalid_request_error"}})
     if response_format is None:
         response_format = resolve_response_format(None)
 
