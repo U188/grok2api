@@ -73,6 +73,12 @@ class DownloadService:
                 return asset_url
             await self.download_file(asset_url, token, media_type)
             return f"{app_url.rstrip('/')}/v1/files/{media_type}{path}"
+        # 没有 app_url 时，assets.grok.com 资源需要 auth 才能访问，直接转 base64
+        if "assets.grok.com" in asset_url and token:
+            try:
+                return await self.parse_b64(asset_url, token, media_type)
+            except Exception:
+                pass
         return asset_url
 
     async def render_image(
