@@ -94,8 +94,10 @@ class ImageEditService:
             tried_tokens.add(current_token)
             try:
                 file_attachments = await self._upload_images(images, current_token)
-                tool_overrides: Dict[str, Any] | None = None
+                tool_overrides: Dict[str, Any] = {"imageGen": True}
                 request_overrides = self._build_request_overrides(n)
+                if not prompt.startswith("Generate an image:"):
+                    prompt = f"Generate an image: {prompt}"
 
                 if stream:
                     response = await GrokChatService().chat(
