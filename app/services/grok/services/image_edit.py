@@ -494,7 +494,7 @@ class ImageCollectProcessor(BaseProcessor):
                 if mr := resp.get("modelResponse"):
                     if urls := _collect_images(mr):
                         for url in urls:
-                            if self.response_format == "url":
+                            if self.response_format == "url" and "assets.grok.com" not in url:
                                 processed = await self.process_url(url, "image")
                                 if processed:
                                     images.append(processed)

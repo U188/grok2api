@@ -298,7 +298,12 @@ async def create_image(request: ImageGenerationRequest):
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
-    data = [{response_field: img} for img in result.data]
+    def _img_item(img: str) -> dict:
+        # assets.grok.com URL 经过 parse_b64 后是 base64 字符串，强制用 b64_json 字段
+        if response_field == "url" and not img.startswith("http"):
+            return {"b64_json": img}
+        return {response_field: img}
+    data = [_img_item(img) for img in result.data]
     usage = result.usage_override or {
         "total_tokens": 0,
         "input_tokens": 0,
@@ -433,7 +438,11 @@ async def edit_image(
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
-    data = [{response_field: img} for img in result.data]
+    def _img_item_edit(img: str) -> dict:
+        if response_field == "url" and not img.startswith("http"):
+            return {"b64_json": img}
+        return {response_field: img}
+    data = [_img_item_edit(img) for img in result.data]
 
     return JSONResponse(
         content={
