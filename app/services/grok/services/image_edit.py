@@ -335,7 +335,7 @@ class ImageStreamProcessor(BaseProcessor):
                 if mr := resp.get("modelResponse"):
                     if urls := _collect_images(mr):
                         for url in urls:
-                            if self.response_format == "url":
+                            if self.response_format == "url" and "assets.grok.com" not in url:
                                 processed = await self.process_url(url, "image")
                                 if processed:
                                     final_images.append(processed)
@@ -393,11 +393,15 @@ class ImageStreamProcessor(BaseProcessor):
                 else:
                     # Original image_generation format
                     image_id = self._get_image_id(out_index)
+                    # assets.grok.com 已转为 base64，强制用 b64_json 字段
+                    out_field = self.response_field
+                    if out_field == "url" and not img_data.startswith("http"):
+                        out_field = "b64_json"
                     yield self._sse(
                         "image_generation.completed",
                         {
                             "type": "image_generation.completed",
-                            self.response_field: img_data,
+                            out_field: img_data,
                             "index": out_index,
                             "image_id": image_id,
                             "stage": "final",
