@@ -7,7 +7,6 @@ from fastapi import APIRouter, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.api.v1.chat import _safe_sse_stream
 from app.core.config import get_config
 from app.core.exceptions import AppException, ErrorType, ValidationException
 from app.services.grok.services.image import ImageGenerationService
