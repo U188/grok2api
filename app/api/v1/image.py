@@ -1,7 +1,7 @@
 from typing import List, Optional
 from tempfile import SpooledTemporaryFile
 from urllib.parse import urlparse
-import httpx
+import aiohttp
 
 from fastapi import APIRouter, HTTPException, Depends, Request, UploadFile
 
@@ -72,13 +72,17 @@ async def edit_image(
                 raise HTTPException(status_code=400, detail="image_url must be a string or array")
 
             image_files = []
-            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as client:
                 for idx, image_url in enumerate(image_urls, 1):
                     if not isinstance(image_url, str) or not image_url.strip():
                         raise HTTPException(status_code=400, detail=f"image_url[{idx}] is invalid")
                     try:
-                        response = await client.get(image_url)
-                        response.raise_for_status()
+                        async with client.get(image_url, allow_redirects=True) as response:
+                            if response.status >= 400:
+                                raise ValueError(f"HTTP {response.status}")
+                            content = await response.read()
+                            content_type_header = response.headers.get("content-type", "application/octet-stream")
                     except Exception as exc:
                         raise HTTPException(status_code=400, detail=f"failed to download image_url[{idx}]: {exc}")
 
@@ -87,9 +91,8 @@ async def edit_image(
                     if parsed.path and parsed.path.rsplit('/', 1)[-1]:
                         filename = parsed.path.rsplit('/', 1)[-1]
 
-                    content_type_header = response.headers.get("content-type", "application/octet-stream")
                     tmp = SpooledTemporaryFile()
-                    tmp.write(response.content)
+                    tmp.write(content)
                     tmp.seek(0)
                     image_files.append(
                         UploadFile(
