@@ -8,10 +8,9 @@ import time
 from pathlib import Path
 from typing import List, Optional, Union
 
-import httpx
+import aiohttp
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse, JSONResponse
-from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel, Field, ValidationError
 
 from app.services.grok.services.image import ImageGenerationService
@@ -360,14 +359,17 @@ async def edit_image(
         if not isinstance(image_url, list):
             return JSONResponse(status_code=400, content={"error": {"message": "image_url must be a string or array", "type": "invalid_request_error"}})
         image = []
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as client:
             for idx, url in enumerate(image_url):
                 try:
-                    resp = await client.get(url)
-                    resp.raise_for_status()
+                    async with client.get(url, allow_redirects=True) as resp:
+                        if resp.status >= 400:
+                            raise ValueError(f"HTTP {resp.status}")
+                        data = await resp.read()
                 except Exception as e:
                     return JSONResponse(status_code=400, content={"error": {"message": f"failed to download image_url[{idx}]: {e}", "type": "invalid_request_error"}})
-                buf = io.BytesIO(resp.content)
+                buf = io.BytesIO(data)
                 upload = UploadFile(filename=f"image_{idx}.png", file=buf)
                 image.append(upload)
     if not prompt:
