@@ -116,24 +116,7 @@ class ImageGenerationService:
                                 chat_format=chat_format,
                             )
                         except UpstreamException as app_chat_error:
-                            if rate_limited(app_chat_error):
-                                raise
-                            logger.warning(
-                                "App-chat image stream failed, falling back to ws_imagine: %s",
-                                app_chat_error,
-                            )
-                            result = await self._stream_ws(
-                                token_mgr=token_mgr,
-                                token=current_token,
-                                model_info=model_info,
-                                prompt=prompt,
-                                n=n,
-                                response_format=response_format,
-                                size=size,
-                                aspect_ratio=aspect_ratio,
-                                enable_nsfw=enable_nsfw,
-                                chat_format=chat_format,
-                            )
+                            raise
                         async for chunk in result.data:
                             yielded = True
                             yield chunk
@@ -194,23 +177,7 @@ class ImageGenerationService:
                         enable_nsfw=enable_nsfw,
                     )
                 except UpstreamException as app_chat_error:
-                    if rate_limited(app_chat_error):
-                        raise
-                    logger.warning(
-                        "App-chat image collect failed, falling back to ws_imagine: %s",
-                        app_chat_error,
-                    )
-                    return await self._collect_ws(
-                        token_mgr=token_mgr,
-                        token=current_token,
-                        model_info=model_info,
-                        tried_tokens=tried_tokens,
-                        prompt=prompt,
-                        n=n,
-                        response_format=response_format,
-                        aspect_ratio=aspect_ratio,
-                        enable_nsfw=enable_nsfw,
-                    )
+                    raise
             except UpstreamException as e:
                 last_error = e
                 if rate_limited(e):
