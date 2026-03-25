@@ -1,22 +1,29 @@
-from typing import Any, List, Optional
-from tempfile import SpooledTemporaryFile
-from urllib.parse import urlparse
+"""
+Image Generation API 路由
+"""
+
+import base64
+import time
+from pathlib import Path
+from typing import List, Optional, Union
+
+import io
 import aiohttp
+from urllib.parse import urlparse
+from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field, ValidationError
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
-
-from app.core.config import get_config
-from app.core.exceptions import AppException, ErrorType, ValidationException
 from app.services.grok.services.image import ImageGenerationService
 from app.services.grok.services.image_edit import ImageEditService
 from app.services.grok.services.model import ModelService
 from app.services.token import get_token_manager
+from app.core.exceptions import ValidationException, AppException, ErrorType
+from app.core.config import get_config
+
 
 router = APIRouter(tags=["Images"])
 
-IMAGINE_FAST_MODEL_ID = "grok-imagine-1.0-fast"
 ALLOWED_IMAGE_SIZES = {
     "1280x720",
     "720x1280",
@@ -25,81 +32,202 @@ ALLOWED_IMAGE_SIZES = {
     "1024x1024",
 }
 
-
-def resolve_aspect_ratio(size: Optional[str]) -> str:
-    aspect_ratio_map = {
-        "1280x720": "16:9",
-        "720x1280": "9:16",
-        "1792x1024": "3:2",
-        "1024x1792": "2:3",
-        "1024x1024": "1:1",
-    }
-    return aspect_ratio_map.get(size or "1024x1024", "1:1")
+SIZE_TO_ASPECT = {
+    "1280x720": "16:9",
+    "720x1280": "9:16",
+    "1792x1024": "3:2",
+    "1024x1792": "2:3",
+    "1024x1024": "1:1",
+}
+ALLOWED_ASPECT_RATIOS = {"1:1", "2:3", "3:2", "9:16", "16:9"}
 
 
 class ImageGenerationRequest(BaseModel):
-    prompt: str = Field(..., description="生成提示词")
-    model: str = Field(default="grok-imagine-1.0", description="模型名称")
-    n: Optional[int] = Field(default=1, ge=1, le=10)
-    size: Optional[str] = Field(default="1024x1024")
-    response_format: Optional[str] = Field(default=None, description="url|b64_json|base64")
+    """图片生成请求 - OpenAI 兼容"""
+
+    prompt: str = Field(..., description="图片描述")
+    model: Optional[str] = Field("grok-imagine-1.0", description="模型名称")
+    n: Optional[int] = Field(1, ge=1, le=10, description="生成数量 (1-10)")
+    size: Optional[str] = Field(
+        "1024x1024",
+        description="图片尺寸: 1280x720, 720x1280, 1792x1024, 1024x1792, 1024x1024",
+    )
+    quality: Optional[str] = Field("standard", description="图片质量 (暂不支持)")
+    response_format: Optional[str] = Field(None, description="响应格式")
+    style: Optional[str] = Field(None, description="风格 (暂不支持)")
+    stream: Optional[bool] = Field(False, description="是否流式输出")
 
 
 class ImageEditRequest(BaseModel):
-    prompt: str = Field(..., description="编辑提示词")
-    model: str = Field(default="grok-imagine-1.0-edit", description="模型名称")
-    n: Optional[int] = Field(default=1, ge=1, le=10)
-    size: Optional[str] = Field(default="1024x1024")
-    response_format: Optional[str] = Field(default=None, description="url|b64_json|base64")
-    user: Optional[str] = None
+    """图片编辑请求 - OpenAI 兼容"""
 
-
-class ImagesResponse(BaseModel):
-    created: int
-    data: List[dict[str, Any]]
-
-
-def _resolve_image_format(value: Optional[str]) -> str:
-    fmt = value or get_config("app.image_format") or "url"
-    if isinstance(fmt, str):
-        fmt = fmt.lower()
-    if fmt == "base64":
-        return "b64_json"
-    if fmt in ("b64_json", "url"):
-        return fmt
-    raise ValidationException(
-        message="response_format must be one of url, base64, b64_json",
-        param="response_format",
-        code="invalid_image_format",
+    prompt: str = Field(..., description="编辑描述")
+    model: Optional[str] = Field("grok-imagine-1.0-edit", description="模型名称")
+    image: Optional[Union[str, List[str]]] = Field(None, description="待编辑图片文件")
+    n: Optional[int] = Field(1, ge=1, le=10, description="生成数量 (1-10)")
+    size: Optional[str] = Field(
+        "1024x1024",
+        description="图片尺寸: 1280x720, 720x1280, 1792x1024, 1024x1792, 1024x1024",
     )
+    quality: Optional[str] = Field("standard", description="图片质量 (暂不支持)")
+    response_format: Optional[str] = Field(None, description="响应格式")
+    style: Optional[str] = Field(None, description="风格 (暂不支持)")
+    stream: Optional[bool] = Field(False, description="是否流式输出")
 
 
-def _image_field(response_format: str) -> str:
-    return "url" if response_format == "url" else "b64_json"
-
-
-def _validate_image_params(n: int, size: str, stream: bool = False):
-    if n < 1 or n > 10:
+def _validate_common_request(
+    request: Union[ImageGenerationRequest, ImageEditRequest],
+    *,
+    allow_ws_stream: bool = False,
+):
+    """通用参数校验"""
+    # 验证 prompt
+    if not request.prompt or not request.prompt.strip():
         raise ValidationException(
-            message="n must be between 1 and 10",
-            param="n",
-            code="invalid_n",
+            message="Prompt cannot be empty", param="prompt", code="empty_prompt"
         )
-    if size not in ALLOWED_IMAGE_SIZES:
+
+    # 验证 n 参数范围
+    if request.n < 1 or request.n > 10:
         raise ValidationException(
-            message=f"size must be one of: {', '.join(sorted(ALLOWED_IMAGE_SIZES))}",
+            message="n must be between 1 and 10", param="n", code="invalid_n"
+        )
+
+    # 流式只支持 n=1 或 n=2
+    if request.stream and request.n not in [1, 2]:
+        raise ValidationException(
+            message="Streaming is only supported when n=1 or n=2",
+            param="stream",
+            code="invalid_stream_n",
+        )
+
+    if allow_ws_stream:
+        if request.stream and request.response_format:
+            allowed_stream_formats = {"b64_json", "base64", "url"}
+            if request.response_format not in allowed_stream_formats:
+                raise ValidationException(
+                    message="Streaming only supports response_format=b64_json/base64/url",
+                    param="response_format",
+                    code="invalid_response_format",
+                )
+
+    if request.response_format:
+        allowed_formats = {"b64_json", "base64", "url"}
+        if request.response_format not in allowed_formats:
+            raise ValidationException(
+                message=f"response_format must be one of {sorted(allowed_formats)}",
+                param="response_format",
+                code="invalid_response_format",
+            )
+
+    if request.size and request.size not in ALLOWED_IMAGE_SIZES:
+        raise ValidationException(
+            message=f"size must be one of {sorted(ALLOWED_IMAGE_SIZES)}",
             param="size",
             code="invalid_size",
         )
-    if stream and n > 1:
+
+
+def validate_generation_request(request: ImageGenerationRequest):
+    """验证图片生成请求参数"""
+    if request.model != "grok-imagine-1.0":
         raise ValidationException(
-            message="streaming image generation only supports n=1",
-            param="n",
-            code="invalid_n",
+            message="The model `grok-imagine-1.0` is required for image generation.",
+            param="model",
+            code="model_not_supported",
+        )
+    # 验证模型 - 通过 is_image 检查
+    model_info = ModelService.get(request.model)
+    if not model_info or not model_info.is_image:
+        # 获取支持的图片模型列表
+        image_models = [m.model_id for m in ModelService.MODELS if m.is_image]
+        raise ValidationException(
+            message=(
+                f"The model `{request.model}` is not supported for image generation. "
+                f"Supported: {image_models}"
+            ),
+            param="model",
+            code="model_not_supported",
+        )
+    _validate_common_request(request, allow_ws_stream=True)
+
+
+def resolve_response_format(response_format: Optional[str]) -> str:
+    """解析响应格式"""
+    fmt = response_format or get_config("app.image_format")
+    if isinstance(fmt, str):
+        fmt = fmt.lower()
+    if fmt in ("b64_json", "base64", "url"):
+        return fmt
+    raise ValidationException(
+        message="response_format must be one of b64_json, base64, url",
+        param="response_format",
+        code="invalid_response_format",
+    )
+
+
+def response_field_name(response_format: str) -> str:
+    """获取响应字段名"""
+    return {"url": "url", "base64": "base64"}.get(response_format, "b64_json")
+
+
+def resolve_aspect_ratio(size: str) -> str:
+    """Map OpenAI size to Grok Imagine aspect ratio."""
+    value = (size or "").strip()
+    if not value:
+        return "2:3"
+    if value in SIZE_TO_ASPECT:
+        return SIZE_TO_ASPECT[value]
+    if ":" in value:
+        try:
+            left, right = value.split(":", 1)
+            left_i = int(left.strip())
+            right_i = int(right.strip())
+            if left_i > 0 and right_i > 0:
+                ratio = f"{left_i}:{right_i}"
+                if ratio in ALLOWED_ASPECT_RATIOS:
+                    return ratio
+        except (TypeError, ValueError):
+            pass
+    return "2:3"
+
+
+def validate_edit_request(request: ImageEditRequest, images: List[UploadFile]):
+    """验证图片编辑请求参数"""
+    if request.model != "grok-imagine-1.0-edit":
+        raise ValidationException(
+            message=("The model `grok-imagine-1.0-edit` is required for image edits."),
+            param="model",
+            code="model_not_supported",
+        )
+    model_info = ModelService.get(request.model)
+    if not model_info or not model_info.is_image_edit:
+        edit_models = [m.model_id for m in ModelService.MODELS if m.is_image_edit]
+        raise ValidationException(
+            message=(
+                f"The model `{request.model}` is not supported for image edits. "
+                f"Supported: {edit_models}"
+            ),
+            param="model",
+            code="model_not_supported",
+        )
+    _validate_common_request(request, allow_ws_stream=False)
+    if not images:
+        raise ValidationException(
+            message="Image is required",
+            param="image",
+            code="missing_image",
+        )
+    if len(images) > 16:
+        raise ValidationException(
+            message="Too many images. Maximum is 16.",
+            param="image",
+            code="invalid_image_count",
         )
 
 
-async def _pick_token_for_model(model: str):
+async def _get_token(model: str):
+    """获取可用 token"""
     token_mgr = await get_token_manager()
     await token_mgr.reload_if_stale()
 
@@ -120,139 +248,260 @@ async def _pick_token_for_model(model: str):
     return token_mgr, token
 
 
-def _images_response(model: str, response_format: str, images: List[str]) -> dict:
-    field = _image_field(response_format)
-    data = [{field: image} for image in images]
-    return {"created": 0, "data": data, "model": model}
+@router.post("/images/generations")
+async def create_image(request: ImageGenerationRequest):
+    """
+    Image Generation API
 
+    流式响应格式:
+    - event: image_generation.partial_image
+    - event: image_generation.completed
 
-@router.post("/images/generations", response_model=ImagesResponse)
-async def generate_image(request: ImageGenerationRequest):
-    try:
-        model = request.model or "grok-imagine-1.0"
-        model_info = ModelService.get(model)
-        if not model_info or not model_info.is_image:
-            raise ValidationException(
-                message="model does not support image generation",
-                param="model",
-                code="invalid_model",
-            )
+    非流式响应格式:
+    - {"created": ..., "data": [{"b64_json": "..."}], "usage": {...}}
+    """
+    # stream 默认为 false
+    if request.stream is None:
+        request.stream = False
 
-        n = request.n or 1
-        size = request.size or "1024x1024"
-        _validate_image_params(n, size, stream=False)
-        response_format = _resolve_image_format(request.response_format)
-        aspect_ratio_map = {
-            "1280x720": "16:9",
-            "720x1280": "9:16",
-            "1792x1024": "3:2",
-            "1024x1792": "2:3",
-            "1024x1024": "1:1",
-        }
-        aspect_ratio = aspect_ratio_map.get(size, "1:1")
+    if request.response_format is None:
+        request.response_format = resolve_response_format(None)
 
-        token_mgr, token = await _pick_token_for_model(model)
-        result = await ImageGenerationService().generate(
-            token_mgr=token_mgr,
-            token=token,
-            model_info=model_info,
-            prompt=request.prompt,
-            n=n,
-            response_format=response_format,
-            size=size,
-            aspect_ratio=aspect_ratio,
-            stream=False,
-            chat_format=False,
+    # 参数验证
+    validate_generation_request(request)
+
+    # 兼容 base64/b64_json
+    if request.response_format == "base64":
+        request.response_format = "b64_json"
+
+    response_format = resolve_response_format(request.response_format)
+    response_field = response_field_name(response_format)
+
+    # 获取 token 和模型信息
+    token_mgr, token = await _get_token(request.model)
+    model_info = ModelService.get(request.model)
+    aspect_ratio = resolve_aspect_ratio(request.size)
+
+    result = await ImageGenerationService().generate(
+        token_mgr=token_mgr,
+        token=token,
+        model_info=model_info,
+        prompt=request.prompt,
+        n=request.n,
+        response_format=response_format,
+        size=request.size,
+        aspect_ratio=aspect_ratio,
+        stream=bool(request.stream),
+    )
+
+    if result.stream:
+        return StreamingResponse(
+            result.data,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
-        return _images_response(model, response_format, result.data)
-    except ValidationException as e:
-        raise HTTPException(status_code=400, detail=e.message)
-    except AppException as e:
-        raise HTTPException(status_code=e.status_code or 500, detail=e.message)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+    def _img_item(img: str) -> dict:
+        # assets.grok.com URL 经过 parse_b64 后是 base64 字符串，强制用 b64_json 字段
+        if response_field == "url" and not img.startswith("http"):
+            return {"b64_json": img}
+        return {response_field: img}
+    data = [_img_item(img) for img in result.data]
+    usage = result.usage_override or {
+        "total_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
+    }
+
+    return JSONResponse(
+        content={
+            "created": int(time.time()),
+            "data": data,
+            "usage": usage,
+        }
+    )
 
 
 @router.post("/images/edits")
-async def edit_image(request: Request):
+async def edit_image(
+    request: Request,
+    prompt: Optional[str] = Form(None),
+    image: Optional[List[UploadFile]] = File(None),
+    model: Optional[str] = Form(None),
+    n: int = Form(1),
+    size: str = Form("1024x1024"),
+    quality: str = Form("standard"),
+    response_format: Optional[str] = Form(None),
+    style: Optional[str] = Form(None),
+    stream: Optional[bool] = Form(False),
+):
+    """
+    Image Edits API
+
+    支持 multipart/form-data 和 application/json + image_url 两种方式
+    """
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        body = await request.json()
+        prompt = body.get("prompt")
+        model = body.get("model")
+        n = int(body.get("n", 1))
+        size = body.get("size", "1024x1024")
+        quality = body.get("quality", "standard")
+        response_format = body.get("response_format")
+        style = body.get("style")
+        stream = body.get("stream", False)
+        image_urls = body.get("image_url")
+        if not image_urls:
+            raise ValidationException(message="image_url is required for image edits", param="image_url", code="missing_param")
+        if isinstance(image_urls, str):
+            image_urls = [image_urls]
+        if not isinstance(image_urls, list):
+            raise ValidationException(message="image_url must be a string or array", param="image_url", code="invalid_param")
+        image = []
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as client:
+            for idx, url in enumerate(image_urls):
+                if not isinstance(url, str) or not url.strip():
+                    raise ValidationException(message=f"image_url[{idx}] is invalid", param="image_url", code="invalid_param")
+                try:
+                    async with client.get(url, allow_redirects=True) as resp:
+                        if resp.status >= 400:
+                            raise ValueError(f"HTTP {resp.status}")
+                        data = await resp.read()
+                        ct = resp.headers.get("content-type", "image/png")
+                except Exception as e:
+                    raise ValidationException(message=f"failed to download image_url[{idx}]: {e}", param="image_url", code="download_failed")
+                parsed = urlparse(url)
+                filename = parsed.path.rsplit("/", 1)[-1] or f"image_{idx}.png"
+                buf = io.BytesIO(data)
+                upload = UploadFile(filename=filename, file=buf, headers={"content-type": ct})
+                image.append(upload)
+    if not prompt:
+        raise ValidationException(message="prompt is required", param="prompt", code="missing_param")
+    if not image:
+        raise ValidationException(message="image is required", param="image", code="missing_param")
+    model = model or "grok-imagine-1.0-edit"
+    if response_format is None:
+        response_format = resolve_response_format(None)
+
     try:
-        content_type = request.headers.get("content-type", "")
-        image_inputs: List[str] = []
-        prompt: Optional[str] = None
-        model: str = "grok-imagine-1.0-edit"
-        n: int = 1
-        response_format: Optional[str] = None
-
-        if content_type.startswith("application/json"):
-            body = await request.json()
-            prompt = body.get("prompt")
-            model = body.get("model") or model
-            n = int(body.get("n") or 1)
-            response_format = body.get("response_format")
-
-            image_urls = body.get("image_url")
-            if not image_urls:
-                raise HTTPException(status_code=400, detail="image_url is required for image edits")
-            if isinstance(image_urls, str):
-                image_urls = [image_urls]
-            if not isinstance(image_urls, list):
-                raise HTTPException(status_code=400, detail="image_url must be a string or array")
-            image_inputs = [u for u in image_urls if isinstance(u, str) and u.strip()]
-        else:
-            form = await request.form()
-            prompt = form.get("prompt")
-            model = form.get("model") or model
-            n_value = form.get("n")
-            n = int(n_value) if n_value not in (None, "") else 1
-            response_format = form.get("response_format")
-
-            files = [item for item in form.getlist("image") if isinstance(item, UploadFile)]
-            if not files:
-                raise HTTPException(status_code=400, detail="image is required for image edits")
-
-            for upload in files:
-                raw = await upload.read()
-                if not raw:
-                    continue
-                filename = upload.filename or "image"
-                content_type_header = upload.content_type or "application/octet-stream"
-                import base64
-                encoded = base64.b64encode(raw).decode("ascii")
-                image_inputs.append(f"data:{content_type_header};base64,{encoded}")
-
-        if not prompt:
-            raise HTTPException(status_code=400, detail="prompt is required")
-
-        model_info = ModelService.get(model)
-        if not model_info or not model_info.is_image_edit:
-            raise HTTPException(status_code=400, detail="model does not support image edits")
-
-        response_format = _resolve_image_format(response_format)
-        _validate_image_params(n, "1024x1024", stream=False)
-
-        token_mgr, token = await _pick_token_for_model(model)
-        result = await ImageEditService().edit(
-            token_mgr=token_mgr,
-            token=token,
-            model_info=model_info,
+        edit_request = ImageEditRequest(
             prompt=prompt,
-            images=image_inputs,
+            model=model,
             n=n,
+            size=size,
+            quality=quality,
             response_format=response_format,
-            stream=False,
-            chat_format=False,
+            style=style,
+            stream=stream,
         )
-        return _images_response(model, response_format, result.data)
-    except HTTPException:
-        raise
-    except ValidationException as e:
-        raise HTTPException(status_code=400, detail=e.message)
-    except AppException as e:
-        raise HTTPException(status_code=e.status_code or 500, detail=e.message)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValidationError as exc:
+        errors = exc.errors()
+        if errors:
+            first = errors[0]
+            loc = first.get("loc", [])
+            msg = first.get("msg", "Invalid request")
+            code = first.get("type", "invalid_value")
+            param_parts = [
+                str(x) for x in loc if not (isinstance(x, int) or str(x).isdigit())
+            ]
+            param = ".".join(param_parts) if param_parts else None
+            raise ValidationException(message=msg, param=param, code=code)
+        raise ValidationException(message="Invalid request", code="invalid_value")
+
+    if edit_request.stream is None:
+        edit_request.stream = False
+
+    response_format = resolve_response_format(edit_request.response_format)
+    if response_format == "base64":
+        response_format = "b64_json"
+    edit_request.response_format = response_format
+    response_field = response_field_name(response_format)
+
+    # 参数验证
+    validate_edit_request(edit_request, image)
+
+    max_image_bytes = 50 * 1024 * 1024
+    allowed_types = {"image/png", "image/jpeg", "image/webp", "image/jpg"}
+
+    images: List[str] = []
+    for item in image:
+        content = await item.read()
+        await item.close()
+        if not content:
+            raise ValidationException(
+                message="File content is empty",
+                param="image",
+                code="empty_file",
+            )
+        if len(content) > max_image_bytes:
+            raise ValidationException(
+                message="Image file too large. Maximum is 50MB.",
+                param="image",
+                code="file_too_large",
+            )
+        mime = (item.content_type or "").lower()
+        if mime == "image/jpg":
+            mime = "image/jpeg"
+        ext = Path(item.filename or "").suffix.lower()
+        if mime not in allowed_types:
+            if ext in (".jpg", ".jpeg"):
+                mime = "image/jpeg"
+            elif ext == ".png":
+                mime = "image/png"
+            elif ext == ".webp":
+                mime = "image/webp"
+            else:
+                raise ValidationException(
+                    message="Unsupported image type. Supported: png, jpg, webp.",
+                    param="image",
+                    code="invalid_image_type",
+                )
+        b64 = base64.b64encode(content).decode()
+        images.append(f"data:{mime};base64,{b64}")
+
+    # 获取 token 和模型信息
+    token_mgr, token = await _get_token(edit_request.model)
+    model_info = ModelService.get(edit_request.model)
+
+    result = await ImageEditService().edit(
+        token_mgr=token_mgr,
+        token=token,
+        model_info=model_info,
+        prompt=edit_request.prompt,
+        images=images,
+        n=edit_request.n,
+        response_format=response_format,
+        stream=bool(edit_request.stream),
+    )
+
+    if result.stream:
+        return StreamingResponse(
+            result.data,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    def _img_item_edit(img: str) -> dict:
+        if response_field == "url" and not img.startswith("http"):
+            return {"b64_json": img}
+        return {response_field: img}
+    data = [_img_item_edit(img) for img in result.data]
+
+    return JSONResponse(
+        content={
+            "created": int(time.time()),
+            "data": data,
+            "usage": {
+                "total_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
+            },
+        }
+    )
 
 
-@router.post("/images/variations")
-async def create_image_variation(request: Request):
-    raise HTTPException(status_code=501, detail="/v1/images/variations is not implemented")
+__all__ = ["router"]
